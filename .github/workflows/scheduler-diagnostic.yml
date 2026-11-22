@@ -1,0 +1,31 @@
+name: TBP-001 schedule-only diagnostic
+on:
+  schedule:
+    - cron: '17,47 14-17 22 11 *'
+permissions: {}
+concurrency:
+  group: tbp-001-schedule-diagnostic
+  cancel-in-progress: false
+jobs:
+  scheduler-signal:
+    if: github.event_name == 'schedule' && github.repository == 'ProjectWhiteOak/tbp-001' && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      CRON_EXPRESSION: ${{ github.event.schedule }}
+    steps:
+      - name: Record scheduler metadata only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = schedule
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$CRON_EXPRESSION" = '17,47 14-17 22 11 *'
+          now=$(date -u '+%s')
+          start=$(date -u -d '2026-11-22 14:17:00' '+%s')
+          end=$(date -u -d '2026-11-22 18:20:00' '+%s')
+          if (( now < start || now >= end )); then
+            echo 'Outside the one-time diagnostic window. No test executed.'
+            exit 1
+          fi
+          printf 'SCHEDULE_SIGNAL event=%s commit=%s run=%s attempt=%s utc=%s\n' "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
