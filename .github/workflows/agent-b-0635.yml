@@ -1,0 +1,74 @@
+name: TBP-001 06:35 Agent B rehearsal
+on:
+  schedule:
+    - cron: '35 12 22 11 *'
+permissions: {}
+jobs:
+  agent-b:
+    if: github.event_name == 'schedule' && github.repository == 'ProjectWhiteOak/tbp-001' && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check date and pin verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = schedule
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          now=$(date -u +%s)
+          start=$(date -u -d '2026-11-22 12:35:00' +%s)
+          end=$(date -u -d '2026-11-22 13:05:00' +%s)
+          test "$now" -ge "$start" && test "$now" -lt "$end"
+          echo "SCHEDULE_SIGNAL event=$GITHUB_EVENT_NAME attempt=$GITHUB_RUN_ATTEMPT utc=$(date -u +%FT%TZ) workflow_sha=$GITHUB_SHA"
+          revision=aee5b6aa543dba06621ac31418eb1797b308c8f0
+          git init -q
+          git fetch --quiet --depth=1 https://github.com/ProjectWhiteOak/tbp-001.git "$revision"
+          git checkout --quiet --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$revision"
+          echo "VERIFIER_REVISION=$revision"
+      - name: Agent B rediscovers the pre-published synthetic beacon
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          from html.parser import HTMLParser
+          from secrets import token_hex
+          from urllib.parse import urljoin
+          from urllib.request import build_opener
+          from tbp.protocol import allowed, digest, discover, make_response, require, stamp, verify
+          from tbp.sources import BYTES, NoRedirect, extract
+
+          root = "https://projectwhiteoak.github.io/tbp-001/rehearsal/"
+          expected = "TBP-001-DRYRUN-002"
+          started = datetime.now(timezone.utc)
+          print("B_STARTED_UTC=" + stamp(started), flush=True)
+          opener = build_opener(NoRedirect())
+          def fetch(url):
+              require(allowed(root, url), "out of scope")
+              with opener.open(url, timeout=10) as response:
+                  require(response.status == 200 and response.geturl() == url, "unexpected response")
+                  data = response.read(BYTES+1)
+              require(len(data) <= BYTES, "response exceeds cap")
+              return data.decode("utf-8")
+          class Links(HTMLParser):
+              urls = set()
+              def handle_starttag(self, tag, attrs):
+                  href = dict(attrs).get("href")
+                  if tag == "a" and href:
+                      url = urljoin(root, href)
+                      if allowed(root, url): self.urls.add(url)
+          p = Links()
+          p.feed(fetch(root))
+          require(0 < len(p.urls) < 10, "invalid link count")
+          url, beacon, hashes, trace = discover(root, [(u,extract(fetch(u))) for u in sorted(p.urls)], expected)
+          pulse = {"source":"fixture", "event_id":"synthetic-0635",
+                   "source_timestamp":stamp(datetime.now(timezone.utc)), "value":token_hex(64)}
+          response = make_response(beacon, hashes, pulse, started, datetime.now(timezone.utc))
+          verify(beacon, hashes, response, digest(response), pulse, expected, started)
+          print("SYNTHETIC_B_PASS discovery=direct_https freshness=simulated no_public_response_write")
+          print("BEACON_SHA256=" + hashes)
+          print("RESPONSE_SHA256=" + digest(response))
+          print("DISCOVERED_URL=" + url)
+          PY
