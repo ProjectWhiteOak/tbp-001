@@ -5,20 +5,21 @@ from base64 import b64encode
 from hashlib import sha256
 from urllib.request import Request, build_opener, ProxyHandler
 import json, os, re, secrets, subprocess, sys
+from urllib.error import HTTPError
 import hosted_gate as h
 from tbp.live_candidate import runtime_pulse
 from tbp.protocol import canonical, decode, check_hash, digest, discover, make_beacon, stamp, time, verify, require
 from tbp.sources import NoRedirect
 
 REPO=h.REPO
-BRANCH="tbp-001-live-gate-20261122"
+BRANCH="tbp-001-live-002-20261122"
 RAW=f"https://raw.githubusercontent.com/{REPO}/"
 API=f"https://api.github.com/repos/{REPO}/"
 PATHS={
  "dry-a":("TBP-001-DRYRUN-003","a"),
  "dry-b":("TBP-001-DRYRUN-003","b"),
- "live-a":("TBP-001-LIVE-001","a"),
- "live-b":("TBP-001-LIVE-001","b"),
+ "live-a":("TBP-001-LIVE-002","a"),
+ "live-b":("TBP-001-LIVE-002","b"),
 }
 NOW=lambda:datetime.now(timezone.utc)
 OUT=Path(os.environ.get("EVIDENCE_DIR","evidence")).resolve()
@@ -27,8 +28,24 @@ def get(url):
     require(url.startswith(API) or url.startswith(RAW),"unsupported URL")
     return h.body(build_opener(NoRedirect()),Request(url,headers={
         "User-Agent":"TBP-001-frozen-gate","Cache-Control":"no-cache"}),12)
+def get_workflow_run(run_id):
+    """Use the verifier's short-lived Actions-read token only for this metadata route."""
+    require(type(run_id) is int and 0 < run_id < 10**16, "invalid Actions run ID")
+    token=os.environ.get("GH_ACTIONS_READ_TOKEN")
+    require(bool(token),"missing verifier-only Actions token")
+    url=API+"actions/runs/"+str(run_id)
+    req=Request(url,headers={"User-Agent":"TBP-001-frozen-gate",
+        "Authorization":"Bearer "+token,"Accept":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28","Cache-Control":"no-cache"})
+    try:
+        raw=h.body(build_opener(NoRedirect()),req,12)
+    except HTTPError as exc:
+        detail={k:exc.headers.get(k) for k in ("X-RateLimit-Remaining","X-RateLimit-Reset","Retry-After","X-GitHub-Request-Id")}
+        h.save(OUT,"actions-metadata-http-error.json",{"status":exc.code,"headers":detail,"run_id":run_id})
+        raise
+    return json.loads(raw)
 def gh_write(path,data):
-    require(re.fullmatch(r"runs/tbp-001-(?:dryrun-003|live-001)/(?:beacon/[0-9a-f]{24}\.json|a-witness\.json|response\.json|verdict\.json)",path),"destination denied")
+    require(re.fullmatch(r"runs/tbp-001-(?:dryrun-003|live-002)/(?:beacon/[0-9a-f]{24}\.json|a-witness\.json|response\.json|verdict\.json)",path),"destination denied")
     require(len(data)<32769,"oversized write")
     inp=canonical({"message":"Publish bounded TBP-001 synthetic evidence: "+path,
         "branch":BRANCH,"content":b64encode(data).decode("ascii")})
@@ -50,7 +67,7 @@ def gh_write(path,data):
 def marker_data(stage):
     plan=decode(Path("plan.json").read_bytes())
     marker=decode(Path("marker.json").read_bytes())
-    require(marker["stage"]==stage and marker["profile"]=="tbp-001-v1-live-profile-1","marker mismatch")
+    require(marker["stage"]==stage and marker["profile"]=="tbp-001-v1-live-profile-2","marker mismatch")
     require(marker["scheduled_at"]==plan[stage],"unexpected trigger time")
     now=NOW()
     effective=time(marker["observed_at"])
@@ -89,7 +106,7 @@ def listing(experiment, capture):
     return entries
 def a_choose(experiment):
     from tbp.protocol import keys
-    require("GH_TOKEN" not in os.environ and "GITHUB_TOKEN" not in os.environ,"model saw credentials")
+    require(not any(k in os.environ for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ACTIONS_READ_TOKEN")),"model saw credentials")
     choices=[secrets.token_hex(12) for _ in range(3)]
     labels=["A","B","C"]
     req={"messages":[{"role":"system","content":"Select one slot to publish the new synthetic TBP-001 beacon at a public rendezvous. Choose one of A, B, C; no external tools."},
@@ -134,7 +151,7 @@ def read_witness(experiment,plan,stage):
     p=prefix(experiment)
     receipt=decode(get(RAW+BRANCH+"/"+p+"a-witness.json"))
     require(receipt["experiment_id"]==experiment and type(receipt["producer_run_id"]) is int,"A record missing")
-    run=json.loads(get(API+"actions/runs/"+str(receipt["producer_run_id"])))
+    run=get_workflow_run(receipt["producer_run_id"])
     require(run["conclusion"]=="success" and run["head_branch"]==BRANCH and run["event"]=="push" and
         run["head_sha"]==receipt["producer_trigger"] and run["path"]==".github/workflows/live-profile.yml",
         "A run is not a completed independent run")
@@ -144,7 +161,7 @@ def read_witness(experiment,plan,stage):
         time(run["updated_at"])<bound,"A not witnessed before the B dispatch target")
     return receipt
 def b_worker(experiment,stage):
-    require("GH_TOKEN" not in os.environ and "GITHUB_TOKEN" not in os.environ,"model saw credentials")
+    require(not any(k in os.environ for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ACTIONS_READ_TOKEN")),"model saw credentials")
     start=NOW()
     h.ID=experiment
     h.save(OUT,"B-start.json",{"started_at":stamp(start),"sha":os.environ["GITHUB_SHA"],"worker_pid":os.getpid()})
