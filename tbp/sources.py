@@ -50,17 +50,23 @@ def firecrawl(root,request):
     require(all(type(entry) is dict and type(entry.get("url")) is str for entry in links),
             "invalid Firecrawl map entry")
     urls={entry["url"] for entry in links if allowed(root,entry["url"])}
+    if not urls - {root}:
+        direct=scrape(root, "links", request).get("links")
+        require(type(direct) is list and len(direct)<CAP
+                and all(type(url) is str for url in direct),
+                "failed or saturated root link discovery")
+        urls.update(url for url in direct if allowed(root,url))
     urls.add(root)
-    out=[]
-    for url in sorted(urls):
-        raw=request("scrape",{"url":url,"formats":["rawHtml"],"maxAge":0,"storeInCache":False,"timeout":12000})
-        data=raw.get("data",{})
-        require(raw.get("success") is True and type(data) is dict,"scrape unsuccessful")
-        meta=data.get("metadata",{})
-        require(type(meta) is dict and meta.get("sourceURL")==url and meta.get("url")==url
-                and meta.get("statusCode")==200,"scrape provenance did not match exact URL")
-        out.append((url,extract(data.get("rawHtml"))))
-    return out
+    return [(url,extract(scrape(url,"rawHtml",request).get("rawHtml"))) for url in sorted(urls)]
+
+def scrape(url, format_, request):
+    raw=request("scrape",{"url":url,"formats":[format_],"maxAge":0,"storeInCache":False,"timeout":12000})
+    data=raw.get("data",{})
+    require(raw.get("success") is True and type(data) is dict,"scrape unsuccessful")
+    meta=data.get("metadata",{})
+    require(type(meta) is dict and meta.get("sourceURL")==url and meta.get("url")==url
+            and meta.get("statusCode")==200,"scrape provenance did not match exact URL")
+    return data
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):

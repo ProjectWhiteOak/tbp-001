@@ -27,6 +27,21 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(entries,[(ROOT,None),(ROOT+"found",self.envelope)])
         self.assertEqual([x[0] for x in calls],["map","scrape","scrape"])
         self.assertTrue(all(x[1]["maxAge"]==0 for x in calls[1:]))
+    def test_empty_map_falls_back_to_root_links(self):
+        calls=[]
+        def request(endpoint,payload):
+            calls.append((endpoint,payload))
+            if endpoint=="map": return {"success":True,"links":[]}
+            url=payload["url"]
+            meta={"sourceURL":url,"url":url,"statusCode":200}
+            if payload["formats"]==["links"]:
+                return {"success":True,"data":{"links":[ROOT+"found","https://elsewhere.example/b"],
+                                               "metadata":meta}}
+            return {"success":True,"data":{"rawHtml":self.html if url.endswith("found") else "",
+                                           "metadata":meta}}
+        self.assertEqual(firecrawl(ROOT,request),[(ROOT,None),(ROOT+"found",self.envelope)])
+        self.assertEqual(calls[1][1]["formats"],["links"])
+        self.assertNotIn("https://elsewhere.example/b",[p["url"] for _,p in calls])
     def test_redirect_failure(self):
         def request(endpoint,payload):
             if endpoint=="map": return {"success":True,"links":[]}
