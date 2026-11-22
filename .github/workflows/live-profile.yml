@@ -1,10 +1,8 @@
 name: TBP-001 external scheduled live profile
 on:
   push:
-    branches: [tbp-001-live-gate-20261122]
+    branches: [tbp-001-live-002-20261122]
     paths:
-      - triggers/dry-a.json
-      - triggers/dry-b.json
       - triggers/live-a.json
       - triggers/live-b.json
 permissions: {}
@@ -121,6 +119,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      actions: read
     env:
       STAGE: ${{ needs.classify.outputs.stage }}
       ROLE: ${{ needs.classify.outputs.role }}
@@ -149,6 +148,8 @@ jobs:
       - name: Independently validate B and its exact signed round
         if: needs.classify.outputs.role == 'b'
         shell: bash
+        env:
+          GH_ACTIONS_READ_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd gate
