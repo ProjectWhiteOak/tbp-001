@@ -1,0 +1,119 @@
+name: TBP-001 hosted synthetic gate
+on:
+  push:
+    branches: [tbp-001-hosted-20261122]
+    paths: [.github/workflows/hosted-synthetic.yml]
+permissions: {}
+concurrency:
+  group: tbp-001-hosted-synthetic-20261122
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  b:
+    if: github.repository == 'ProjectWhiteOak/tbp-001' && github.event.repository.visibility == 'public' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch only the pinned implementation; no local fixtures or credentials for B
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p gate/tbp
+          cd gate
+          for f in hosted_gate.py quicknet.cjs package.json package-lock.json tbp/{direct_pages,live_candidate,protocol,sources}.py; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA/hosted-gate/$f" -o "$f"
+          done
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Pin and build official llama.cpp CPU server; verify Qwen model bytes
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          rt="$RUNNER_TEMP/llama-cpp"
+          rev=9c10c94e16ebc4f3ed7c06264a93bf7e019c3f26
+          git init -q "$rt"
+          git -C "$rt" fetch -q --depth=1 https://github.com/ggml-org/llama.cpp.git "$rev"
+          git -C "$rt" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$rt" rev-parse HEAD)" = "$rev"
+          printf '%s\n' "$rev" > evidence/llama-source-commit.txt
+          model=qwen3.5-4b-q4_k_m.gguf
+          (
+            set -e
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-time 250 --retry 1 --retry-max-time 250 --max-filesize 3100000000               https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/720bb031aae5488eae5d6a78768e6d826662b2ae/Qwen3.5-4B-Q4_K_M.gguf               -o "$RUNNER_TEMP/$model"
+            cd "$RUNNER_TEMP"
+            printf '%s  %s\n' 00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4 "$model" | sha256sum -c
+          ) > evidence/model-download.txt 2>&1 &
+          download_pid=$!
+          trap 'kill "$download_pid" 2>/dev/null || true' EXIT
+          cmake -S "$rt" -B "$rt/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF             > evidence/cmake.log 2>&1 || { tail -60 evidence/cmake.log; exit 1; }
+          cmake --build "$rt/build" --target llama-server -j 4             > evidence/build.log 2>&1 || { tail -60 evidence/build.log; exit 1; }
+          wait "$download_pid" || { cat evidence/model-download.txt; exit 1; }
+          trap - EXIT
+          sha256sum "$rt/build/bin/llama-server" > evidence/llama-binary-sha256.txt
+          cat evidence/model-download.txt
+      - name: Start clean model, run preflight, and fire the bounded hosted timer
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/preflight
+          date -u +%FT%TZ > evidence/hosted-step-utc.txt
+          printf 'run=%s\nattempt=%s\nsha=%s\nevent=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$GITHUB_EVENT_NAME" > evidence/runner.txt
+          "$RUNNER_TEMP/llama-cpp/build/bin/llama-server" --model "$RUNNER_TEMP/qwen3.5-4b-q4_k_m.gguf"             --host 127.0.0.1 --port 18080 --ctx-size 2048 --threads 4 --parallel 1 --n-gpu-layers 0             > evidence/model-server.log 2>&1 &
+          model_pid=$!
+          trap 'kill "$model_pid" 2>/dev/null || true' EXIT
+          for i in {1..80}; do
+            kill -0 "$model_pid" || { tail -60 evidence/model-server.log; exit 1; }
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/health > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS --max-time 2 http://127.0.0.1:18080/health > evidence/model-ready.json
+          PYTHONDONTWRITEBYTECODE=1 python3 gate/hosted_gate.py timer evidence
+      - name: Preserve synthetic worker evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tbp-hosted-b-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
+  verify:
+    needs: b
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch only the pinned implementation; no local fixtures or credentials for B
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          mkdir -p gate/tbp
+          cd gate
+          for f in hosted_gate.py quicknet.cjs package.json package-lock.json tbp/{direct_pages,live_candidate,protocol,sources}.py; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA/hosted-gate/$f" -o "$f"
+          done
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Read the exact worker artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tbp-hosted-b-evidence
+          path: evidence
+      - name: Independently re-discover the beacon and verify the same signed round
+        run: |
+          set -euo pipefail
+          mkdir evidence/verification
+          PYTHONDONTWRITEBYTECODE=1 python3 gate/hosted_gate.py verify evidence
+      - name: Publish verified synthetic response to the isolated branch, then read back anonymously
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 gate/hosted_gate.py publish evidence
+      - name: Preserve verifier evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tbp-hosted-verifier-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
