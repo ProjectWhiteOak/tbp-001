@@ -1,0 +1,222 @@
+name: TBP-001 external scheduled live profile
+on:
+  push:
+    branches: [tbp-001-live-gate-20261122]
+    paths:
+      - triggers/dry-a.json
+      - triggers/dry-b.json
+      - triggers/live-a.json
+      - triggers/live-b.json
+permissions: {}
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  EVIDENCE_DIR: ${{ github.workspace }}/evidence
+jobs:
+  classify:
+    if: github.repository == 'ProjectWhiteOak/tbp-001' && github.event.repository.visibility == 'public' && github.event_name == 'push' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    outputs:
+      stage: ${{ steps.freeze.outputs.stage }}
+      role: ${{ steps.freeze.outputs.role }}
+    steps:
+      - name: Validate single create-only marker and exact preregistered tree
+        id: freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init -q
+          git fetch -q --depth=48 https://github.com/ProjectWhiteOak/tbp-001.git "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          [[ "$(git diff-tree --no-commit-id --name-status -r HEAD)" =~ ^A[[:space:]]triggers/(dry-a|dry-b|live-a|live-b)\.json$ ]]
+          stage="${BASH_REMATCH[1]}"
+          role="${stage: -1}"
+          marker="triggers/$stage.json"
+          freeze="$(jq -er .freeze_commit "$marker")"
+          tree="$(jq -er .tree_sha "$marker")"
+          [[ "$freeze" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$freeze" HEAD
+          test "$(git rev-parse "$freeze^{tree}")" = "$tree"
+          git diff --exit-code "$freeze" HEAD -- live-gate hosted-gate .github/workflows/live-profile.yml
+          printf 'stage=%s\nrole=%s\n' "$stage" "$role" >> "$GITHUB_OUTPUT"
+          printf 'FREEZE %s %s STAGE %s HEAD %s\n' "$freeze" "$tree" "$stage" "$GITHUB_SHA"
+  model:
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      STAGE: ${{ needs.classify.outputs.stage }}
+    steps:
+      - name: Fetch frozen implementation and schedule marker without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          mkdir -p gate/tbp
+          cd gate
+          u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
+          for f in hosted_gate.py quicknet.cjs package.json package-lock.json tbp/{direct_pages,live_candidate,protocol,sources}.py; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/hosted-gate/$f" -o "$f"
+          done
+          for f in run_gate.py plan.json; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/live-gate/$f" -o "$f"
+          done
+          curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/triggers/$STAGE.json" -o marker.json
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Pin and build official llama.cpp CPU server; verify Qwen model bytes
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          rt="$RUNNER_TEMP/llama-cpp"
+          rev=9c10c94e16ebc4f3ed7c06264a93bf7e019c3f26
+          git init -q "$rt"
+          git -C "$rt" fetch -q --depth=1 https://github.com/ggml-org/llama.cpp.git "$rev"
+          git -C "$rt" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$rt" rev-parse HEAD)" = "$rev"
+          printf '%s\n' "$rev" > evidence/llama-source-commit.txt
+          model=qwen3.5-4b-q4_k_m.gguf
+          (
+            set -e
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-time 250 --retry 1 --retry-max-time 250 --max-filesize 3100000000               https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/720bb031aae5488eae5d6a78768e6d826662b2ae/Qwen3.5-4B-Q4_K_M.gguf               -o "$RUNNER_TEMP/$model"
+            cd "$RUNNER_TEMP"
+            printf '%s  %s\n' 00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4 "$model" | sha256sum -c
+          ) > evidence/model-download.txt 2>&1 &
+          download_pid=$!
+          trap 'kill "$download_pid" 2>/dev/null || true' EXIT
+          cmake -S "$rt" -B "$rt/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF             > evidence/cmake.log 2>&1 || { tail -60 evidence/cmake.log; exit 1; }
+          cmake --build "$rt/build" --target llama-server -j 4             > evidence/build.log 2>&1 || { tail -60 evidence/build.log; exit 1; }
+          wait "$download_pid" || { cat evidence/model-download.txt; exit 1; }
+          trap - EXIT
+          sha256sum "$rt/build/bin/llama-server" > evidence/llama-binary-sha256.txt
+          cat evidence/model-download.txt
+      - name: Start the isolated model and execute the selected role
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          date -u +%FT%TZ > evidence/hosted-step-utc.txt
+          printf 'run=%s\nattempt=%s\nsha=%s\nevent=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$GITHUB_EVENT_NAME" > evidence/runner.txt
+          "$RUNNER_TEMP/llama-cpp/build/bin/llama-server" --model "$RUNNER_TEMP/qwen3.5-4b-q4_k_m.gguf"             --host 127.0.0.1 --port 18080 --ctx-size 2048 --threads 4 --parallel 1 --n-gpu-layers 0             > evidence/model-server.log 2>&1 &
+          model_pid=$!
+          trap 'kill "$model_pid" 2>/dev/null || true' EXIT
+          for i in {1..80}; do
+            kill -0 "$model_pid" || { tail -60 evidence/model-server.log; exit 1; }
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/health > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS --max-time 2 http://127.0.0.1:18080/health > evidence/model-ready.json
+          cd gate
+          python3 run_gate.py worker "$STAGE"
+      - name: Preserve raw model and public source evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: model-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
+  verify-publish:
+    needs: [classify,model]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      STAGE: ${{ needs.classify.outputs.stage }}
+      ROLE: ${{ needs.classify.outputs.role }}
+    steps:
+      - name: Fetch frozen implementation and schedule marker without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          mkdir -p gate/tbp
+          cd gate
+          u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
+          for f in hosted_gate.py quicknet.cjs package.json package-lock.json tbp/{direct_pages,live_candidate,protocol,sources}.py; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/hosted-gate/$f" -o "$f"
+          done
+          for f in run_gate.py plan.json; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/live-gate/$f" -o "$f"
+          done
+          curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/triggers/$STAGE.json" -o marker.json
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Import this run's exact model evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: model-evidence
+          path: evidence
+      - name: Independently validate B and its exact signed round
+        if: needs.classify.outputs.role == 'b'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd gate
+          python3 run_gate.py b-verify "$STAGE"
+      - name: Publish only the validated role's synthetic data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd gate
+          case "$ROLE" in
+            a) python3 run_gate.py a-publish "$STAGE";;
+            b) python3 run_gate.py b-publish "$STAGE";;
+            *) exit 1;;
+          esac
+      - name: Preserve verification and publication evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: published-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
+  witness-a:
+    needs: [classify,verify-publish]
+    if: needs.classify.outputs.role == 'a'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      STAGE: ${{ needs.classify.outputs.stage }}
+    steps:
+      - name: Fetch frozen implementation and schedule marker without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          mkdir -p gate/tbp
+          cd gate
+          u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
+          for f in hosted_gate.py quicknet.cjs package.json package-lock.json tbp/{direct_pages,live_candidate,protocol,sources}.py; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/hosted-gate/$f" -o "$f"
+          done
+          for f in run_gate.py plan.json; do
+            curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/live-gate/$f" -o "$f"
+          done
+          curl -fsS --proto '=https' --max-time 20 --retry 2 "$u/triggers/$STAGE.json" -o marker.json
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Read this A run's publication evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: published-evidence
+          path: evidence
+      - name: Witness A by anonymously retrieving exact public bytes on a separate runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd gate
+          python3 run_gate.py a-witness "$STAGE"
+      - name: Preserve independent public witness evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: witnessed-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
