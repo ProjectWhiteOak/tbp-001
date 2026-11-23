@@ -12,15 +12,10 @@ from tbp.protocol import canonical, decode, check_hash, digest, discover, make_b
 from tbp.sources import NoRedirect
 
 REPO=h.REPO
-BRANCH="tbp-001-live-002-20261122"
+BRANCH="tbp-001-live-003-long-gap"
 RAW=f"https://raw.githubusercontent.com/{REPO}/"
 API=f"https://api.github.com/repos/{REPO}/"
-PATHS={
- "dry-a":("TBP-001-DRYRUN-003","a"),
- "dry-b":("TBP-001-DRYRUN-003","b"),
- "live-a":("TBP-001-LIVE-002","a"),
- "live-b":("TBP-001-LIVE-002","b"),
-}
+PATHS={"live-a":("TBP-001-LIVE-003","a"),"live-b":("TBP-001-LIVE-003","b")}
 NOW=lambda:datetime.now(timezone.utc)
 OUT=Path(os.environ.get("EVIDENCE_DIR","evidence")).resolve()
 # Loaded only from the triggering commit; no domain/path/token data from model output.
@@ -45,7 +40,7 @@ def get_workflow_run(run_id):
         raise
     return json.loads(raw)
 def gh_write(path,data):
-    require(re.fullmatch(r"runs/tbp-001-(?:dryrun-003|live-002)/(?:beacon/[0-9a-f]{24}\.json|a-witness\.json|response\.json|verdict\.json)",path),"destination denied")
+    require(re.fullmatch(r"runs/tbp-001-live-003/(?:beacon/[0-9a-f]{24}\.json|a-witness\.json|response\.json|verdict\.json)",path),"destination denied")
     require(len(data)<32769,"oversized write")
     inp=canonical({"message":"Publish bounded TBP-001 synthetic evidence: "+path,
         "branch":BRANCH,"content":b64encode(data).decode("ascii")})
@@ -64,19 +59,31 @@ def gh_write(path,data):
         "raw_sha256":sha256(observed).hexdigest()}
     h.save(OUT,"publish-"+Path(path).name+".json",record)
     return record
+def scheduled_b(seen, minimum_seconds):
+    require(type(minimum_seconds) is int and minimum_seconds in (86400,259200,604800),
+        "invalid preregistered gap")
+    exact=seen+timedelta(seconds=minimum_seconds)
+    if exact.microsecond:
+        exact=exact.replace(microsecond=0)+timedelta(seconds=1)
+    return exact
+
 def marker_data(stage):
     plan=decode(Path("plan.json").read_bytes())
     marker=decode(Path("marker.json").read_bytes())
-    require(marker["stage"]==stage and marker["profile"]=="tbp-001-v1-live-profile-2","marker mismatch")
-    require(marker["scheduled_at"]==plan[stage],"unexpected trigger time")
+    require(marker["stage"]==stage and marker["profile"]=="tbp-001-v1-long-gap-profile-1","marker mismatch")
+    if stage=="live-a":
+        require(marker["scheduled_at"]==plan[stage],"unexpected trigger time")
+    else:
+        # B receives only a timing marker, not A's witness or locator.
+        # The separate verifier below independently checks this derived time.
+        require(plan[stage] is None,"B must derive schedule from the witnessed publication")
+        plan[stage]=marker["scheduled_at"]
     now=NOW()
     effective=time(marker["observed_at"])
     start=time(plan[stage])
     lower=effective-start
-    if stage=="dry-a":
-        require(timedelta(0)<=lower<=timedelta(minutes=10),"control trigger window")
-    else:
-        require(marker["origin"]=="external_dot_automation" and timedelta(0)<=lower<=timedelta(minutes=8),"outside external dispatch window")
+    require(marker["origin"]=="external_dot_automation" and timedelta(0)<=lower<=timedelta(minutes=8),
+        "outside external dispatch window")
     require(effective<=now+timedelta(seconds=3) and now<=start+timedelta(minutes=22),"runner start outside frozen window")
     return marker, plan
 def prefix(experiment):
@@ -157,6 +164,8 @@ def read_witness(experiment,plan,stage):
         "A run is not a completed independent run")
     bound=time(plan[stage])
     seen=time(receipt["independent_observed_at"])
+    require(bound==scheduled_b(seen,plan["minimum_gap_seconds"]),
+        "B target does not match the frozen age formula")
     require(time(run["created_at"])<=time(receipt["publication"]["observed_at"])<=seen<bound and
         time(run["updated_at"])<bound,"A not witnessed before the B dispatch target")
     return receipt
@@ -176,6 +185,15 @@ def b_verify(experiment,stage,marker,plan):
     receipt=read_witness(experiment,plan,stage)
     start=time(h.read(OUT,"B-start.json")["started_at"])
     require(time(marker["observed_at"])<=start<=time(plan[stage])+timedelta(minutes=22),"B clock outside window")
+    seen=time(receipt["independent_observed_at"])
+    observed_gap=start-seen
+    require(observed_gap>=timedelta(seconds=plan["minimum_gap_seconds"]),
+        "B started before the minimum witnessed gap")
+    h.save(OUT,"gap-criteria.json",{
+        "minimum_gap_seconds":plan["minimum_gap_seconds"],
+        "witnessed_at":stamp(seen),"scheduled_b":plan[stage],"started_b":stamp(start),
+        "observed_gap_microseconds":observed_gap//timedelta(microseconds=1),
+        "minimum_gap_and_dispatch_checks":"PASS"})
     require(h.read(OUT,"B-start.json")["sha"]==os.environ["GITHUB_SHA"],"B code lineage mismatch")
     result=h.read(OUT,"worker-result.json")
     work=OUT/"independent"

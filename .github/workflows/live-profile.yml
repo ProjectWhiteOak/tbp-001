@@ -1,7 +1,7 @@
 name: TBP-001 external scheduled live profile
 on:
   push:
-    branches: [tbp-001-live-002-20261122]
+    branches: [tbp-001-live-003-long-gap]
     paths:
       - triggers/live-a.json
       - triggers/live-b.json
@@ -27,7 +27,7 @@ jobs:
           git init -q
           git fetch -q --depth=48 https://github.com/ProjectWhiteOak/tbp-001.git "$GITHUB_SHA"
           git checkout -q --detach FETCH_HEAD
-          [[ "$(git diff-tree --no-commit-id --name-status -r HEAD)" =~ ^A[[:space:]]triggers/(dry-a|dry-b|live-a|live-b)\.json$ ]]
+          [[ "$(git diff-tree --no-commit-id --name-status -r HEAD)" =~ ^A[[:space:]]triggers/(live-a|live-b)\.json$ ]]
           stage="${BASH_REMATCH[1]}"
           role="${stage: -1}"
           marker="triggers/$stage.json"
@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(live-a|live-b)$ ]]
           mkdir -p gate/tbp
           cd gate
           u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
@@ -128,7 +128,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(live-a|live-b)$ ]]
           mkdir -p gate/tbp
           cd gate
           u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
@@ -188,7 +188,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(dry-a|dry-b|live-a|live-b)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ && "$STAGE" =~ ^(live-a|live-b)$ ]]
           mkdir -p gate/tbp
           cd gate
           u="https://raw.githubusercontent.com/ProjectWhiteOak/tbp-001/$GITHUB_SHA"
